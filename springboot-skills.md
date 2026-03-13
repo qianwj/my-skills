@@ -303,19 +303,314 @@ JAR 结构:
 
 ---
 
-## 三、关键源码路径速查
+## 三、Spring Data Redis 核心机制
+
+### 16. RedisTemplate 核心操作
+
+**核心类:** `spring-data-redis/src/main/java/org/springframework/data/redis/core/RedisTemplate.java`
+
+**工作原理:**
+- Redis 数据访问的中心抽象，自动序列化/反序列化
+- 使用 `RedisCallback` 接口处理底层连接
+- 自动管理连接生命周期（获取 → 执行 → 释放）
+- 线程安全（初始化后）
+
+**执行模式:**
+```
+execute(RedisCallback)
+  └─ getConnection()
+       └─ doInRedis(connection)
+            └─ releaseConnection()
+```
+
+**操作类型:**
+
+| 操作 | 接口 | 典型方法 |
+|------|------|---------|
+| 字符串 | `ValueOperations<K,V>` | set, get, append, increment |
+| 列表 | `ListOperations<K,V>` | push, pop, range, trim |
+| 集合 | `SetOperations<K,V>` | add, remove, union, intersect |
+| 有序集合 | `ZSetOperations<K,V>` | zadd, zrange, zrank |
+| 哈希 | `HashOperations<K,HK,HV>` | hset, hget, hgetall |
+| 地理位置 | `GeoOperations<K,V>` | geoadd, geodist, georadius |
+| HyperLogLog | `HyperLogLogOperations<K,V>` | pfadd, pfcount |
+| Stream | `StreamOperations<K,HK,HV>` | xadd, xread, xgroup |
+
+**Bound Operations（绑定键操作）:**
+```java
+BoundValueOperations<K,V> ops = redisTemplate.boundValueOps("mykey");
+ops.set("value");
+ops.increment();
+```
+
+---
+
+### 17. 连接管理
+
+**工厂接口:** `RedisConnectionFactory`
+
+**Lettuce 实现:** `LettuceConnectionFactory`（基于 Netty 的异步客户端）
+
+**支持的配置模式:**
+- `RedisStandaloneConfiguration` — 单实例
+- `RedisStaticMasterReplicaConfiguration` — 主从复制
+- `RedisSentinelConfiguration` — Sentinel 高可用
+- `RedisClusterConfiguration` — 集群模式
+- `RedisSocketConfiguration` — Unix Socket
+
+**连接共享:** 默认多个 `LettuceConnection` 共享一个线程安全的原生连接，提升性��。
+
+**连接池:** 可选配置 `LettucePoolingClientConfiguration` 使用 Apache Commons Pool2。
+
+---
+
+### 18. 序列化策略
+
+**核心接口:** `RedisSerializer<T>`
+
+| 序列化器 | 用途 | 场景 |
+|---------|------|------|
+| `StringRedisSerializer` | UTF-8 字符串 | 键/值为字符串 |
+| `JdkSerializationRedisSerializer` | Java 对象序列化 | 默认，任何 Serializable |
+| `Jackson2JsonRedisSerializer` | Jackson JSON（类型化） | 特定类型 JSON |
+| `GenericJackson2JsonRedisSerializer` | Jackson JSON（通用） | 多态类型 + 类型信息 |
+| `ByteArrayRedisSerializer` | 字节数组透传 | 原始二进制 |
+| `GenericToStringSerializer` | toString/构造器 | 自定义字符串转换 |
+
+**配置示例:**
+```java
+RedisTemplate<String, Object> template = new RedisTemplate<>();
+template.setKeySerializer(new StringRedisSerializer());
+template.setValueSerializer(new GenericJackson2JsonRedisSerializer());
+template.setHashKeySerializer(new StringRedisSerializer());
+template.setHashValueSerializer(new GenericJackson2JsonRedisSerializer());
+```
+
+---
+
+### 19. Spring Cache 集成
+
+**核心类:** `RedisCache` / `RedisCacheManager`
+
+**工作流程:**
+```
+@Cacheable("users")
+  └─ CacheInterceptor
+       └─ RedisCacheManager.getCache("users")
+            └─ RedisCache.get(key)
+                 ├─ 命中 → 反序列化返回
+                 └─ 未命中 → 执行方法 → put(key, result)
+```
+
+**配置选项:**
+- `RedisCacheConfiguration` — TTL、键前缀、序列化器
+- `enableStatistics()` — 启用缓存统计
+- `disableCachingNullValues()` — 禁止缓存 null
+- `entryTtl(Duration)` — 设置过期时间
+
+**锁机制:** 使用 `RedisCacheWriter` 的 `lock()` 防止缓存击穿（多线程同时加载同一键）。
+
+---
+
+### 20. Pipeline & Transaction
+
+**Pipeline（管道）:**
+```java
+List<Object> results = redisTemplate.executePipelined(
+    (RedisCallback<Object>) connection -> {
+        connection.set("key1".getBytes(), "value1".getBytes());
+        connection.get("key2".getBytes());
+        return null; // 返回值被忽略
+    }
+);
+```
+- 批量发送命令，减少网络往返
+- 返回所有命令的结果列表
+
+**Transaction（事务）:**
+```java
+redisTemplate.execute(new SessionCallback<List<Object>>() {
+    public List<Object> execute(RedisOperations operations) {
+        operations.multi();
+        operations.opsForValue().set("key1", "value1");
+        operations.opsForValue().increment("counter");
+        return operations.exec(); // 原子执行
+    }
+});
+```
+- `MULTI` / `EXEC` 包裹的命令原子执行
+- 不支持回滚（Redis 特性）
+
+---
+
+### 21. Pub/Sub 消息监听
+
+**核心类:** `RedisMessageListenerContainer`
+
+**配置示例:**
+```java
+@Bean
+RedisMessageListenerContainer container(RedisConnectionFactory factory) {
+    RedisMessageListenerContainer container = new RedisMessageListenerContainer();
+    container.setConnectionFactory(factory);
+    container.addMessageListener(new MessageListener() {
+        public void onMessage(Message message, byte[] pattern) {
+            System.out.println("Received: " + message);
+        }
+    }, new ChannelTopic("news"));
+    return container;
+}
+```
+
+**监听器类型:**
+- `MessageListener` — 原始字节消息
+- `MessageListenerAdapter` — 自动反序列化 + 方法委托
+
+**Topic 类型:**
+- `ChannelTopic` — 精确频道匹配
+- `PatternTopic` — 模式匹配（如 `news.*`）
+
+---
+
+### 22. Redis Repository
+
+**核心类:** `RedisKeyValueAdapter` / `RedisRepositoryFactoryBean`
+
+**使用方式:**
+```java
+@RedisHash("users")
+public class User {
+    @Id String id;
+    @Indexed String email;
+    String name;
+}
+
+interface UserRepository extends CrudRepository<User, String> {
+    List<User> findByEmail(String email);
+}
+```
+
+**索引机制:**
+- `@Indexed` 字段会创建 Redis Set 作为二级索引
+- 查询时通过索引 Set 快速定位主键，再获取完整对象
+
+**存储结构:**
+```
+users:{id}           → Hash（对象字段）
+users:{id}:idx       → Set（索引引用）
+users:email:{value}  → Set（email 索引，存储 id）
+```
+
+**TTL 支持:** `@TimeToLive` 注解或 `@RedisHash(timeToLive=60)`
+
+---
+
+### 23. Redis Streams
+
+**核心接口:** `StreamOperations<K, HK, HV>`
+
+**生产消息:**
+```java
+StreamRecords.newRecord()
+    .ofObject(new SensorData(...))
+    .withStreamKey("sensor-stream");
+streamOps.add(record);
+```
+
+**消费消息（Consumer Group）:**
+```java
+StreamReadOptions options = StreamReadOptions.empty()
+    .block(Duration.ofSeconds(2))
+    .count(10);
+
+List<MapRecord<String, Object, Object>> messages = streamOps.read(
+    Consumer.from("group1", "consumer1"),
+    options,
+    StreamOffset.create("sensor-stream", ReadOffset.lastConsumed())
+);
+
+// 确认消息
+streamOps.acknowledge("group1", record);
+```
+
+**特性:**
+- 支持 Consumer Group（多消费者负载均衡）
+- 支持 Pending 消息（未确认消息重新投递）
+- 支持范围查询（按 ID 或时间）
+
+---
+
+### 24. Lua 脚本执行
+
+**核心类:** `DefaultScriptExecutor` / `RedisScript<T>`
+
+**使用方式:**
+```java
+RedisScript<Long> script = RedisScript.of(
+    "return redis.call('incr', KEYS[1])",
+    Long.class
+);
+
+Long result = redisTemplate.execute(
+    script,
+    Collections.singletonList("counter")
+);
+```
+
+**脚本缓存:** 使用 `SCRIPT LOAD` + `EVALSHA` 减少网络传输。
+
+**原子性保证:** Lua 脚本在 Redis 中原子执行，适合复杂的原子操作（如限流、分布式锁）。
+
+---
+
+### 25. ReactiveRedisTemplate
+
+**核心类:** `ReactiveRedisTemplate`
+
+**与同步版本的区别:**
+- 返回 `Mono<T>` / `Flux<T>`（Project Reactor）
+- 基于 `ReactiveRedisConnection`（非阻塞 I/O）
+- 禁止 null 值（Reactive Streams 规范）
+
+**使用示例:**
+```java
+ReactiveRedisTemplate<String, String> template = ...;
+
+Mono<Boolean> result = template.opsForValue()
+    .set("key", "value")
+    .then(template.expire("key", Duration.ofMinutes(5)));
+```
+
+**Reactive 操作:**
+- `ReactiveValueOperations`
+- `ReactiveListOperations`
+- `ReactiveSetOperations`
+- `ReactiveZSetOperations`
+- `ReactiveHashOperations`
+- `ReactiveStreamOperations`
+
+**脚本执行:** `DefaultReactiveScriptExecutor` 返回 `Mono<T>`。
+
+---
+
+## 四、关键源码路径速查
 
 | 功能 | 路径 |
 |------|------|
-| Bean 生命周期 | `spring-beans/src/main/java/org/springframework/beans/factory/support/AbstractAutowireCapableBeanFactory.java` |
-| Context 刷新 | `spring-context/src/main/java/org/springframework/context/support/AbstractApplicationContext.java` |
-| Configuration 解析 | `spring-context/src/main/java/org/springframework/context/annotation/ConfigurationClassPostProcessor.java` |
-| AOP 代理选择 | `spring-aop/src/main/java/org/springframework/aop/framework/DefaultAopProxyFactory.java` |
-| 事务拦截器 | `spring-tx/src/main/java/org/springframework/transaction/interceptor/TransactionInterceptor.java` |
-| @Autowired 注入 | `spring-beans/src/main/java/org/springframework/beans/factory/annotation/AutowiredAnnotationBeanPostProcessor.java` |
-| DispatcherServlet | `spring-webmvc/src/main/java/org/springframework/web/servlet/DispatcherServlet.java` |
-| SpringApplication | `core/spring-boot/src/main/java/org/springframework/boot/SpringApplication.java` |
-| 自动配置选择器 | `core/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/AutoConfigurationImportSelector.java` |
-| 条件注解 | `core/spring-boot-autoconfigure/src/main/java/org/springframework/boot/autoconfigure/condition/` |
-| ConfigurationProperties | `core/spring-boot/src/main/java/org/springframework/boot/context/properties/` |
-| Fat JAR Loader | `loader/spring-boot-loader/src/main/java/org/springframework/boot/loader/` |
+| Bean 生命周期 | `spring-beans/.../support/AbstractAutowireCapableBeanFactory.java` |
+| Context 刷新 | `spring-context/.../support/AbstractApplicationContext.java` |
+| Configuration 解析 | `spring-context/.../annotation/ConfigurationClassPostProcessor.java` |
+| AOP 代理选择 | `spring-aop/.../framework/DefaultAopProxyFactory.java` |
+| 事务拦截器 | `spring-tx/.../interceptor/TransactionInterceptor.java` |
+| @Autowired 注入 | `spring-beans/.../annotation/AutowiredAnnotationBeanPostProcessor.java` |
+| DispatcherServlet | `spring-webmvc/.../web/servlet/DispatcherServlet.java` |
+| SpringApplication | `spring-boot/core/spring-boot/.../SpringApplication.java` |
+| 自动配置选择器 | `spring-boot/core/spring-boot-autoconfigure/.../AutoConfigurationImportSelector.java` |
+| 条件注解 | `spring-boot/core/spring-boot-autoconfigure/.../condition/` |
+| ConfigurationProperties | `spring-boot/core/spring-boot/.../context/properties/` |
+| Fat JAR Loader | `spring-boot/loader/spring-boot-loader/.../loader/` |
+| RedisTemplate | `spring-data-redis/src/main/java/.../redis/core/RedisTemplate.java` |
+| LettuceConnectionFactory | `spring-data-redis/src/main/java/.../redis/connection/lettuce/LettuceConnectionFactory.java` |
+| RedisCache | `spring-data-redis/src/main/java/.../redis/cache/RedisCache.java` |
+| RedisMessageListenerContainer | `spring-data-redis/src/main/java/.../redis/listener/RedisMessageListenerContainer.java` |
+| RedisKeyValueAdapter | `spring-data-redis/src/main/java/.../redis/core/RedisKeyValueAdapter.java` |
